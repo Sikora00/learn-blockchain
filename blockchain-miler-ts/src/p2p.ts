@@ -7,198 +7,122 @@ import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { Block } from './model/block';
 import { Blockchain } from './model/blockchain';
 import { identify } from '@libp2p/identify';
+import { encode } from './p2p/helpers';
+import { PeerEvents } from './p2p/peerEvents';
+import { Subscribers } from './p2p/subscribers';
+import { HandlerRegistry } from './p2p/handlers/handlers-registry';
+import { ChainResponseHandler } from './p2p/handlers/chain-response';
+import { LocalChainRequestHandler } from './p2p/handlers/localChainRequest';
+import { ReceivedBlockHandler } from './p2p/handlers/receivedBlock';
+import {
+  BLOCK_TOPIC,
+  CHAIN_TOPIC,
+  ChainResponse,
+  LocalChainRequest,
+  PubsubLike,
+  getPubsub,
+  hasNoPeersError,
+} from './p2p/pubsub';
 
-export const CHAIN_TOPIC = 'CHAINS';
-export const BLOCK_TOPIC = 'BLOCKS';
-
-export interface ChainResponse {
-  blocks: Array<{ header: Block['header']; data: string }>;
-  receiver: string;
-}
-
-export interface LocalChainRequest {
-  from_peer_id: string;
-}
-
-function encode(str: string): Uint8Array {
-  return new TextEncoder().encode(str);
-}
-
-function decode(buf: Uint8Array): string {
-  return new TextDecoder().decode(buf);
-}
+export { CHAIN_TOPIC, BLOCK_TOPIC } from './p2p/pubsub';
+export type { ChainResponse, LocalChainRequest } from './p2p/pubsub';
 
 export class P2PNode {
   private constructor(
     public node: Libp2p,
     public blockchain: Blockchain,
-    private discoveredPeers: Set<string> = new Set()
+    private discoveredPeers: Set<string> = new Set(),
+    private pubsub: PubsubLike
   ) {}
 
   static async create(blockchain: Blockchain): Promise<P2PNode> {
-    const t = tcp() as any;
-    const mx = yamux() as any;
-    const ns = noise() as any;
-    const md = mdns() as any;
-    const gs = gossipsub() as any;
     const node = await createLibp2p({
       addresses: {
         listen: ['/ip4/0.0.0.0/tcp/0'],
       },
       connectionGater: {},
-      transports: [t],
-      connectionEncrypters: [ns],
-      streamMuxers: [mx],
-      peerDiscovery: [md],
+      transports: [tcp()],
+      connectionEncrypters: [noise()],
+      streamMuxers: [yamux()],
+      peerDiscovery: [mdns()],
       services: {
-        pubsub: gs,
+        pubsub: gossipsub(),
         identify: identify(),
       },
     });
 
-    const p2p = new P2PNode(node, blockchain);
-    p2p.setupEventHandlers();
+    // Ensure services are started before wiring subscribers and handlers
     await node.start();
+
+    const pubsub = getPubsub(node);
+    if (!pubsub) {
+      throw new Error('Pubsub service not available on the libp2p node');
+    }
+
+    const p2p = new P2PNode(node, blockchain, new Set(), pubsub);
+    p2p.initialize();
     return p2p;
   }
 
   get peerId(): string {
-    return (this.node as any).peerId.toString();
+    return this.node.peerId.toString();
   }
 
-  private setupEventHandlers() {
-    // Track discovered peers (mdns)
-    // @ts-ignore: event names are runtime-verified
-    this.node.addEventListener('peer:discovery', async (evt: any) => {
-      try {
-        const pid = evt.detail?.id;
-        const id = pid?.toString?.() ?? String(pid);
-        if (id && id !== this.peerId) this.discoveredPeers.add(id);
-        if (pid && id !== this.peerId) {
-          // proactively dial discovered peers
+  async stop(): Promise<void> {
+    await this.node.stop();
+  }
+
+  private initialize(): void {
+    // Attach peer event handlers, ensure we attempt chain request shortly after connecting
+    new PeerEvents(this.node, () => this.peerId, this.discoveredPeers, {
+      onConnect: () =>
+        setTimeout(() => this.requestChainWithRetry(5, 1000), 750),
+    }).attach();
+
+    // Setup pubsub and subscribers with handler registry
+    void this.pubsub.subscribe(CHAIN_TOPIC);
+    void this.pubsub.subscribe(BLOCK_TOPIC);
+
+    // Create handler registry and register handlers
+    const registry = new HandlerRegistry();
+
+    registry.register(
+      CHAIN_TOPIC,
+      new ChainResponseHandler(
+        {
+          peerId: () => this.peerId,
+          updateBlockchain: (newBlockchain) => {
+            this.blockchain = newBlockchain;
+          },
+        },
+        () => this.blockchain
+      )
+    );
+
+    registry.register(
+      CHAIN_TOPIC,
+      new LocalChainRequestHandler(
+        {
+          publishMessage: (topic, data) => this.publishIfAny(topic, data),
+        },
+        () => this.blockchain
+      )
+    );
+
+    registry.register(
+      BLOCK_TOPIC,
+      new ReceivedBlockHandler({
+        addBlock: (block) => {
           try {
-            await (this.node as any).dial?.(pid);
-          } catch {}
-        }
-      } catch {}
-    });
-
-    // When we connect to a peer, try to request their chain
-    // @ts-ignore: event names are runtime-verified
-    this.node.addEventListener('peer:connect', async (evt: any) => {
-      try {
-        const conn = evt.detail;
-        const pid =
-          conn?.remotePeer ?? conn?.detail?.remotePeer ?? conn?.id ?? conn;
-        const id = pid?.toString?.() ?? String(pid);
-        if (id && id !== this.peerId) this.discoveredPeers.add(id);
-      } catch {}
-      // give pubsub a moment to receive subscriptions then request
-      setTimeout(() => this.requestChainWithRetry(5, 1000), 750);
-    });
-
-    // When a peer disconnects, drop it from set
-    this.node.addEventListener('peer:disconnect', (evt: any) => {
-      try {
-        const conn = evt.detail;
-        const pid =
-          conn?.remotePeer ?? conn?.detail?.remotePeer ?? conn?.id ?? conn;
-        const id = pid?.toString?.() ?? String(pid);
-        if (id) this.discoveredPeers.delete(id);
-      } catch {}
-    });
-
-    // Subscribe to topics
-    (this.node as any).services.pubsub.subscribe(CHAIN_TOPIC);
-    (this.node as any).services.pubsub.subscribe(BLOCK_TOPIC);
-
-    // Handle pubsub messages
-    // @ts-ignore: event names are runtime-verified
-    (this.node as any).services.pubsub.addEventListener(
-      'message',
-      (evt: any) => {
-        const { topic, data, from } = evt.detail ?? evt;
-        const bytes: Uint8Array = data;
-        const txt = decode(bytes);
-
-        // Try parse in the same order as Rust
-        // 1) ChainResponse
-        try {
-          const resp = JSON.parse(txt) as ChainResponse;
-          if (
-            resp &&
-            typeof resp === 'object' &&
-            'blocks' in resp &&
-            'receiver' in resp
-          ) {
-            if (resp.receiver === this.peerId) {
-              this.handleChainResponse(resp);
-              return;
-            }
+            this.blockchain.add_block(block);
+          } catch (e: unknown) {
+            throw e;
           }
-        } catch {}
-
-        // 2) LocalChainRequest
-        try {
-          const req = JSON.parse(txt) as LocalChainRequest;
-          if (req && typeof req === 'object' && 'from_peer_id' in req) {
-            this.handleLocalChainRequest(from);
-            return;
-          }
-        } catch {}
-
-        // 3) Block
-        try {
-          const obj = JSON.parse(txt) as {
-            header: Block['header'];
-            data: string;
-          };
-          if (obj && obj.header && typeof obj.data === 'string') {
-            const block = new Block(obj.header, obj.data);
-            this.handleReceivedBlock(block);
-            return;
-          }
-        } catch {}
-      }
+        },
+      })
     );
-  }
 
-  // Mirrors Rust handle_chain_response
-  private handleChainResponse(resp: ChainResponse) {
-    const remoteBlocks = resp.blocks.map((b) => new Block(b.header, b.data));
-    const remote = new Blockchain(remoteBlocks);
-    this.blockchain = this.blockchain.choose_chain(this.blockchain, remote);
-    console.info(
-      'Chain response merged from',
-      resp.receiver,
-      'new length:',
-      this.blockchain.blocks.length
-    );
-  }
-
-  // Mirrors Rust handle_local_chain_request
-  private handleLocalChainRequest(receiverPeer: string) {
-    console.info('Sending local chain to:', receiverPeer);
-    const response: ChainResponse = {
-      blocks: this.blockchain.blocks.map((b) => ({
-        header: b.header,
-        data: b.data,
-      })),
-      receiver: receiverPeer,
-    };
-    const json = JSON.stringify(response);
-    this.publishIfAny(CHAIN_TOPIC, encode(json));
-  }
-
-  // Mirrors Rust handle_received_block
-  private handleReceivedBlock(block: Block) {
-    console.info('Received block from:', block.header.hash);
-    try {
-      this.blockchain.add_block(block);
-      console.info('Block added to local chain');
-    } catch (e) {
-      console.error('Failed to add block to local chain:', e);
-    }
+    new Subscribers(this.pubsub, registry).attach();
   }
 
   // Public helpers analogous to Rust API
@@ -227,12 +151,16 @@ export class P2PNode {
     const latest = this.blockchain.blocks[this.blockchain.blocks.length - 1];
     const newBlock = Block.new(latest.header.id + 1, latest.header.hash, data);
     this.blockchain.blocks.push(newBlock);
-    console.info('Broadcasting block to peers...');
+    console.info('📤 Broadcasting block to peers...', {
+      blockId: newBlock.header.id,
+      hash: newBlock.header.hash,
+      peersCount: this.get_list_of_peers().length,
+    });
     this.publishIfAny(BLOCK_TOPIC, encode(newBlock.to_json_string()));
   }
 
   // Mirrors Rust init event
-  async init_after_delay(ms = 1000) {
+  async init_after_delay(ms = 1000): Promise<void> {
     await new Promise((r) => setTimeout(r, ms));
     console.info('sending init event');
     // Ensure genesis exists
@@ -243,7 +171,7 @@ export class P2PNode {
     this.requestChainWithRetry(8, 1000);
   }
 
-  private requestChainWithRetry(attempts = 5, delayMs = 1000) {
+  private requestChainWithRetry(attempts = 5, delayMs = 1000): void {
     const peers = this.get_list_of_peers();
     const last = peers[peers.length - 1];
     if (!last) {
@@ -262,26 +190,43 @@ export class P2PNode {
 
   // Safely publish only if there are peers subscribed to the topic
   private publishIfAny(topic: string, data: Uint8Array): boolean {
-    const pubsub = (this.node as any).services?.pubsub;
-    if (!pubsub) return false;
     try {
-      const subs = pubsub.getSubscribers
-        ? pubsub.getSubscribers(topic)
+      const subs = this.pubsub.getSubscribers
+        ? this.pubsub.getSubscribers(topic)
         : undefined;
-      const size = Array.isArray(subs) ? subs.length : subs?.size ?? undefined;
+      const size = Array.isArray(subs)
+        ? subs.length
+        : (subs as Set<unknown> | undefined)?.size ?? undefined;
+
+      console.info('🔍 Publishing check:', {
+        topic,
+        subscribersCount: size,
+        hasGetSubscribers: !!this.pubsub.getSubscribers,
+        dataLength: data.length,
+      });
+
       if (size !== undefined && size === 0) {
-        console.info(`No peers subscribed to ${topic}, skipping publish`);
+        console.info(`❌ No peers subscribed to ${topic}, skipping publish`);
         return false;
       }
-    } catch {}
-    Promise.resolve(pubsub.publish(topic, data)).catch((e: any) => {
-      const msg = String(e?.message || e);
-      if (msg.includes('NoPeersSubscribedToTopic')) {
-        console.info(`Skipping publish to ${topic}: no peers yet`);
-      } else {
-        console.error('Publish failed:', e);
-      }
-    });
+    } catch (e) {
+      console.warn('Error checking subscribers:', e);
+    }
+
+    console.info('🚀 Publishing message to topic:', topic);
+    debugger;
+    this.pubsub
+      .publish(topic, data)
+      .then(() => {
+        console.info(`✅ Message published to ${topic}`);
+      })
+      .catch((e: unknown) => {
+        if (hasNoPeersError(e)) {
+          console.info(`Skipping publish to ${topic}: no peers yet`);
+        } else {
+          console.error('Publish failed:', e);
+        }
+      });
     return true;
   }
 
@@ -290,21 +235,18 @@ export class P2PNode {
     data: Uint8Array,
     attempts = 5,
     delayMs = 1000
-  ) {
-    const pubsub = (this.node as any).services?.pubsub;
-    if (!pubsub) return;
-    Promise.resolve(pubsub.publish(topic, data))
+  ): void {
+    Promise.resolve(this.pubsub.publish(topic, data))
       .then(() => {
         // success
       })
-      .catch((e: any) => {
-        const msg = String(e?.message || e);
-        if (attempts > 0 && msg.includes('NoPeersSubscribedToTopic')) {
+      .catch((e: unknown) => {
+        if (attempts > 0 && hasNoPeersError(e)) {
           setTimeout(
             () => this.publishWithRetry(topic, data, attempts - 1, delayMs),
             delayMs
           );
-        } else if (!msg.includes('NoPeersSubscribedToTopic')) {
+        } else if (!hasNoPeersError(e)) {
           console.error('Publish failed:', e);
         }
       });
