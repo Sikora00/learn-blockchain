@@ -77,8 +77,8 @@ Notes
 
 ## Milestones checklist
 
-- [ ] Walk through and annotate Marcin’s project
-- [ ] Add tracing/logging and a couple of validation tests
+- [x] Walk through and annotate Marcin’s project
+- [x] Add tracing/logging and a couple of validation tests
 - [ ] Bitcoin keys: generate, sign, verify; derive addresses
 - [ ] Parse and inspect a raw Bitcoin transaction
 - [ ] Parse and verify Bitcoin block headers (SPV-style)
